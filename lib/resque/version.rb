@@ -1,3 +1,4 @@
 module Resque
-  Version = VERSION = '1.21.0'
+  Version = '1.21.0' unless defined? Version
+  VERSION = '1.21.0' unless defined? VERSION
 end
