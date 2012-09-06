@@ -20,8 +20,6 @@ module Resque
     # Automatically set if a fork(2) fails.
     attr_accessor :cant_fork
 
-    attr_accessor :term_timeout
-
     attr_writer :to_s
 
     # Returns an array of all worker objects.
@@ -130,9 +128,7 @@ module Resque
       loop do
         break if shutdown?
 
-        pause if should_pause?
-
-        if job = reserve(interval)
+        if not paused? and job = reserve
           log "got: #{job.inspect}"
           job.worker = self
           run_hook :before_fork, job
@@ -141,13 +137,8 @@ module Resque
           if @child = fork
             srand # Reseeding
             procline "Forked #{@child} at #{Time.now.to_i}"
-            begin
-              Process.waitpid(@child)
-            rescue SystemCallError
-              nil
-            end
+            Process.wait(@child)
           else
-            unregister_signal_handlers if !@cant_fork
             procline "Processing #{job.queue} since #{Time.now.to_i}"
             redis.client.reconnect # Don't share connection with parent
             perform(job, &block)
@@ -158,8 +149,9 @@ module Resque
           @child = nil
         else
           break if interval.zero?
-          log! "Timed out after #{interval} seconds"
+          log! "Sleeping for #{interval} seconds"
           procline paused? ? "Paused" : "Waiting for #{@queues.join(',')}"
+          sleep interval
         end
       end
 
@@ -201,24 +193,20 @@ module Resque
 
     # Attempts to grab a job off one of the provided queues. Returns
     # nil if no job can be found.
-    def reserve(interval = 5.0)
-      interval = interval.to_i
-      multi_queue = MultiQueue.new(
-        queues.map {|queue| Queue.new(queue, Resque.redis, Resque.coder) },
-        Resque.redis)
-
-      if interval < 1
-        begin
-          queue, job = multi_queue.pop(true)
-        rescue ThreadError
-          queue, job = nil
+    def reserve
+      queues.each do |queue|
+        log! "Checking #{queue}"
+        if job = Resque.reserve(queue)
+          log! "Found job on #{queue}"
+          return job
         end
-      else
-        queue, job = multi_queue.poll(interval.to_i)
       end
 
-      log! "Found job on #{queue}"
-      Job.new(queue.name, job) if queue && job
+      nil
+    rescue Exception => e
+      log "Error reserving job: #{e.inspect}"
+      log e.backtrace.join("\n")
+      raise e
     end
 
     # Returns a list of queues to use when searching for a job.
@@ -285,23 +273,12 @@ module Resque
         trap('QUIT') { shutdown   }
         trap('USR1') { kill_child }
         trap('USR2') { pause_processing }
+        trap('CONT') { unpause_processing }
       rescue ArgumentError
         warn "Signals QUIT, USR1, USR2, and/or CONT not supported."
       end
 
       log! "Registered signals"
-    end
-
-    def unregister_signal_handlers
-      trap('TERM') { raise TermException.new("SIGTERM") }
-      trap('INT', 'DEFAULT')
-
-      begin
-        trap('QUIT', 'DEFAULT')
-        trap('USR1', 'DEFAULT')
-        trap('USR2', 'DEFAULT')
-      rescue ArgumentError
-      end
     end
 
     # Schedule this worker for shutdown. Will finish processing the
@@ -322,44 +299,23 @@ module Resque
       @shutdown
     end
 
-    # Kills the forked child immediately with minimal remorse. The job it
-    # is processing will not be completed. Send the child a TERM signal,
-    # wait 5 seconds, and then a KILL signal if it has not quit
+    # Kills the forked child immediately, without remorse. The job it
+    # is processing will not be completed.
     def kill_child
       if @child
-        unless Process.waitpid(@child, Process::WNOHANG)
-          log! "Sending TERM signal to child #{@child}"
-          Process.kill("TERM", @child)
-          (term_timeout.to_f * 10).round.times do |i|
-            sleep(0.1)
-            return if Process.waitpid(@child, Process::WNOHANG)
-          end
-          log! "Sending KILL signal to child #{@child}"
-          Process.kill("KILL", @child)
+        log! "Killing child at #{@child}"
+        if system("ps -o pid,state -p #{@child}")
+          Process.kill("KILL", @child) rescue nil
         else
-          log! "Child #{@child} already quit."
+          log! "Child #{@child} not found, restarting."
+          shutdown
         end
       end
-    rescue SystemCallError
-      log! "Child #{@child} already quit and reaped."
     end
 
     # are we paused?
-    def should_pause?
+    def paused?
       @paused
-    end
-    alias :paused? :should_pause?
-
-    def pause
-      rd, wr = IO.pipe
-      trap('CONT') {
-        log "CONT received; resuming job processing"
-        @paused = false
-        wr.write 'x'
-        wr.close
-      }
-      rd.read 1
-      rd.close
     end
 
     # Stop processing jobs after the current one has completed (if we're
@@ -367,6 +323,12 @@ module Resque
     def pause_processing
       log "USR2 received; pausing job processing"
       @paused = true
+    end
+
+    # Start processing jobs again after a pause
+    def unpause_processing
+      log "CONT received; resuming job processing"
+      @paused = false
     end
 
     # Looks for any workers which should be running on this server
@@ -515,8 +477,9 @@ module Resque
     end
     alias_method :id, :to_s
 
+    # chomp'd hostname of this machine
     def hostname
-      Socket.gethostname
+      @hostname ||= `hostname`.chomp
     end
 
     # Returns Integer PID of running worker
