@@ -34,7 +34,7 @@
       <th>Name</th>
       <th>Jobs</th>
     </tr>
-    <% for queue in resque.queues.sort_by { |q| q.to_s } %>
+    <% for queue in resque.queues.select{|q| resque.size(queue)>0}.sort_by { |q| q.to_s } %>
     <tr>
       <td class='queue'><a class="queue" href="<%= u "queues/#{queue}" %>"><%= queue %></a></td>
       <td class='size'><%= resque.size queue %></td>
