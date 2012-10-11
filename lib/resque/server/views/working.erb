@@ -59,7 +59,8 @@
         </td>
         <td class='process'>
           <% if job['queue'] %>
-            <code><%=job['payload']['args'][1].join("</code><br><code>") %></code>
+            <code><%=[job['payload']['args'][1].instance_eval{|a| a.map{|k,v| "#{k} : #{v}" }.join("</code><br><code>") if a.class==Hash}].compact.join("") %></code>
+            <br>
             <small><a class="queue time" href="<%=u "/working/#{worker}" %>"><%= job['run_at'] %></a></small>
           <% else %>
             <span class='waiting'>Waiting for a job...</span>
